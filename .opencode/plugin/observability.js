@@ -86,6 +86,9 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
   console.log(`[Observability] Plugin loaded for agent: ${agentName}`);
   console.log(`[Observability] Session ID: ${currentSessionId}`);
 
+  // Cache to store args from before hook for use in after hook
+  const argsCache = new Map();
+
   // Send initial SessionStart event
   sendEvent('SessionStart', {
     session_id: currentSessionId,
@@ -96,13 +99,27 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
   return {
     /**
      * Tool execution started (maps to PreToolUse)
-     * OpenCode passes: (input, output) where input.tool is the tool name
-     * and output.args contains the arguments
+     * OpenCode structure:
+     * - First param: { tool, sessionID, callID }
+     * - Second param: { args } where args is the tool arguments object
      */
-    "tool.execute.before": async (input, output) => {
-      // OpenCode structure: input.tool, output.args
-      const toolName = input?.tool || 'unknown';
-      const toolArgs = output?.args || {};
+    "tool.execute.before": async ({ tool, sessionID, callID }, { args }) => {
+      // Debug: Log the raw data OpenCode sends
+      if (process.env.OBSERVABILITY_DEBUG) {
+        console.log('[Observability] tool.execute.before:');
+        console.log('  tool:', tool);
+        console.log('  sessionID:', sessionID);
+        console.log('  callID:', callID);
+        console.log('  args:', JSON.stringify(args, null, 2));
+      }
+
+      const toolName = tool || 'unknown';
+      const toolArgs = args || {};
+
+      // Cache args for use in after hook
+      if (callID) {
+        argsCache.set(callID, toolArgs);
+      }
 
       // Build tool_input matching Claude Code format
       const toolInput = {};
@@ -148,15 +165,35 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
 
     /**
      * Tool execution completed (maps to PostToolUse)
+     * OpenCode structure:
+     * - First param: { tool, sessionID, callID }
+     * - Second param: { title, output, metadata }
      */
-    "tool.execute.after": async (input, output) => {
-      const toolName = input?.tool || 'unknown';
-      const toolArgs = output?.args || {};
-      const toolResult = output?.result || output?.output || '';
+    "tool.execute.after": async ({ tool, sessionID, callID }, { title, output, metadata }) => {
+      // Debug: Log the raw data OpenCode sends
+      if (process.env.OBSERVABILITY_DEBUG) {
+        console.log('[Observability] tool.execute.after:');
+        console.log('  tool:', tool);
+        console.log('  sessionID:', sessionID);
+        console.log('  callID:', callID);
+        console.log('  title:', title);
+        console.log('  output:', typeof output === 'string' ? output.slice(0, 200) : JSON.stringify(output)?.slice(0, 200));
+        console.log('  metadata:', JSON.stringify(metadata, null, 2));
+      }
 
-      // Build tool_input matching Claude Code format
+      const toolName = tool || 'unknown';
+
+      // Retrieve cached args from before hook using callID
+      const cachedArgs = callID ? argsCache.get(callID) : null;
+      if (callID) {
+        argsCache.delete(callID); // Clean up cache
+      }
+
+      // Build tool_input from cached args or metadata
+      const toolArgs = cachedArgs || metadata?.input || metadata?.args || {};
       const toolInput = {};
 
+      // Handle different tool types
       if (toolArgs.command) {
         toolInput.command = toolArgs.command;
       }
@@ -166,6 +203,9 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
       if (toolArgs.pattern) {
         toolInput.pattern = toolArgs.pattern;
       }
+      if (toolArgs.query) {
+        toolInput.query = toolArgs.query;
+      }
 
       // If no specific args found, include all args
       if (Object.keys(toolInput).length === 0 && Object.keys(toolArgs).length > 0) {
@@ -174,14 +214,14 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
 
       // Truncate large outputs
       let toolOutput = '';
-      if (typeof toolResult === 'string') {
-        toolOutput = toolResult.length > 2000 ? toolResult.slice(0, 2000) + '...' : toolResult;
-      } else if (toolResult) {
+      if (typeof output === 'string') {
+        toolOutput = output.length > 2000 ? output.slice(0, 2000) + '...' : output;
+      } else if (output) {
         try {
-          const jsonStr = JSON.stringify(toolResult);
+          const jsonStr = JSON.stringify(output);
           toolOutput = jsonStr.length > 2000 ? jsonStr.slice(0, 2000) + '...' : jsonStr;
         } catch {
-          toolOutput = String(toolResult).slice(0, 2000);
+          toolOutput = String(output).slice(0, 2000);
         }
       }
 
@@ -189,7 +229,7 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
         tool_name: toolName,
         tool_input: toolInput,
         tool_output: toolOutput,
-        tool_error: output?.error ? String(output.error) : null,
+        tool_error: metadata?.error ? String(metadata.error) : null,
         session_id: currentSessionId
       };
 
