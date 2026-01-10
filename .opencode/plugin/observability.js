@@ -23,7 +23,7 @@ function extractAgentName(directory) {
     return wardennMatch[1];
   }
 
-  // Try to extract from .opencode project path
+  // Try to extract from project path
   const projectMatch = directory.match(/\/([^\/]+)\/?$/);
   if (projectMatch) {
     return projectMatch[1];
@@ -35,6 +35,7 @@ function extractAgentName(directory) {
 
 /**
  * Send event to observability server
+ * Matches the format expected by claude-code-hooks-multi-agent-observability
  */
 async function sendEvent(eventType, payload, sessionId, sourceApp, modelName = '') {
   try {
@@ -42,7 +43,7 @@ async function sendEvent(eventType, payload, sessionId, sourceApp, modelName = '
       source_app: sourceApp,
       session_id: sessionId || 'unknown',
       hook_event_type: eventType,
-      payload: payload,
+      payload: payload,  // Full payload matching Claude Code format
       timestamp: Date.now(),
       model_name: modelName
     };
@@ -61,7 +62,6 @@ async function sendEvent(eventType, payload, sessionId, sourceApp, modelName = '
     }
   } catch (error) {
     // Silently fail to not block OpenCode operations
-    // Only log in debug mode
     if (process.env.OBSERVABILITY_DEBUG) {
       console.error(`[Observability] Error sending event: ${error.message}`);
     }
@@ -86,44 +86,68 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
   // Send initial SessionStart event
   const initialPayload = {
     session_id: currentSessionId,
-    agent_name: agentName,
-    model: currentModel,
     cwd: directory,
-    project: project?.name || agentName,
-    created_at: Date.now()
+    project_name: project?.name || agentName,
+    agent_name: agentName
   };
-
-  // Fire SessionStart immediately when plugin loads
   sendEvent('SessionStart', initialPayload, currentSessionId, agentName, currentModel);
 
   return {
     /**
      * Tool execution started (maps to PreToolUse)
+     * Payload format matches Claude Code's PreToolUse hook
      */
     "tool.execute.before": async (event) => {
+      // Structure payload to match Claude Code format
+      // Claude Code sends: { tool_name, tool_input, session_id, ... }
+      const toolName = event.tool || event.name || 'unknown';
+      const toolInput = event.input || event.args || event.parameters || {};
+
       const payload = {
-        tool_name: event.tool || event.name || 'unknown',
-        tool_input: event.input || event.args || {},
+        tool_name: toolName,
+        tool_input: toolInput,
         session_id: currentSessionId,
-        agent_name: agentName,
         cwd: directory
       };
+
+      // Log for debugging
+      if (process.env.OBSERVABILITY_DEBUG) {
+        console.log(`[Observability] PreToolUse: ${toolName}`, JSON.stringify(toolInput).slice(0, 200));
+      }
 
       await sendEvent('PreToolUse', payload, currentSessionId, agentName, currentModel);
     },
 
     /**
      * Tool execution completed (maps to PostToolUse)
+     * Payload format matches Claude Code's PostToolUse hook
      */
     "tool.execute.after": async (event) => {
+      const toolName = event.tool || event.name || 'unknown';
+      const toolInput = event.input || event.args || event.parameters || {};
+      const toolOutput = event.output || event.result || event.response || '';
+      const toolError = event.error || null;
+
+      // Truncate large outputs for display
+      let outputStr = '';
+      if (typeof toolOutput === 'string') {
+        outputStr = toolOutput.length > 2000 ? toolOutput.slice(0, 2000) + '...' : toolOutput;
+      } else if (toolOutput) {
+        try {
+          const jsonStr = JSON.stringify(toolOutput);
+          outputStr = jsonStr.length > 2000 ? jsonStr.slice(0, 2000) + '...' : jsonStr;
+        } catch {
+          outputStr = String(toolOutput).slice(0, 2000);
+        }
+      }
+
       const payload = {
-        tool_name: event.tool || event.name || 'unknown',
-        tool_input: event.input || event.args || {},
-        tool_output: event.output || event.result || '',
-        tool_error: event.error || null,
+        tool_name: toolName,
+        tool_input: toolInput,
+        tool_output: outputStr,
+        tool_error: toolError ? String(toolError) : null,
         session_id: currentSessionId,
-        agent_name: agentName,
-        duration_ms: event.duration || 0
+        duration_ms: event.duration || event.elapsed || 0
       };
 
       await sendEvent('PostToolUse', payload, currentSessionId, agentName, currentModel);
@@ -139,11 +163,9 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
 
       const payload = {
         session_id: currentSessionId,
-        agent_name: agentName,
         model: currentModel,
         cwd: directory,
-        project: project?.name || agentName,
-        created_at: Date.now()
+        project_name: project?.name || agentName
       };
 
       await sendEvent('SessionStart', payload, currentSessionId, agentName, currentModel);
@@ -155,10 +177,8 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
     "session.idle": async (event) => {
       const payload = {
         session_id: currentSessionId,
-        agent_name: agentName,
-        reason: 'idle',
-        cwd: directory,
-        stopped_at: Date.now()
+        stop_reason: event.reason || 'end_turn',
+        cwd: directory
       };
 
       await sendEvent('Stop', payload, currentSessionId, agentName, currentModel);
@@ -170,8 +190,7 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
     "session.compacted": async (event) => {
       const payload = {
         session_id: currentSessionId,
-        agent_name: agentName,
-        reason: event.reason || 'context_limit',
+        summary: event.summary || 'Context compacted',
         tokens_before: event.tokensBefore || 0,
         tokens_after: event.tokensAfter || 0
       };
@@ -183,13 +202,13 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
      * Message updated (maps to UserPromptSubmit for user messages)
      */
     "message.updated": async (event) => {
-      // Only send for user messages
       if (event.role === 'user' || event.type === 'user') {
+        const messageContent = event.content || event.text || event.message || '';
+
         const payload = {
           session_id: currentSessionId,
-          agent_name: agentName,
-          message: event.content || event.text || '',
-          role: event.role || 'user'
+          prompt: typeof messageContent === 'string' ? messageContent : JSON.stringify(messageContent),
+          cwd: directory
         };
 
         await sendEvent('UserPromptSubmit', payload, currentSessionId, agentName, currentModel);
@@ -197,30 +216,30 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
     },
 
     /**
-     * File edited (custom event for file operations)
+     * File edited
      */
     "file.edited": async (event) => {
       const payload = {
-        session_id: currentSessionId,
-        agent_name: agentName,
-        file_path: event.path || event.file || '',
-        changes: event.changes || [],
-        tool_name: 'Edit'
+        tool_name: 'Edit',
+        tool_input: {
+          file_path: event.path || event.file || '',
+          changes: event.changes || event.diff || ''
+        },
+        session_id: currentSessionId
       };
 
       await sendEvent('PostToolUse', payload, currentSessionId, agentName, currentModel);
     },
 
     /**
-     * Command events (permission requests)
+     * Permission request (maps to Notification)
      */
     "command.permission": async (event) => {
       const payload = {
         session_id: currentSessionId,
-        agent_name: agentName,
-        command: event.command || '',
-        allowed: event.allowed || false,
-        tool_name: 'Bash'
+        type: 'permission',
+        message: event.message || `Permission requested for: ${event.command || 'unknown'}`,
+        command: event.command || ''
       };
 
       await sendEvent('Notification', payload, currentSessionId, agentName, currentModel);
