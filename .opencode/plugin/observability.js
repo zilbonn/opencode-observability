@@ -9,15 +9,37 @@
  */
 
 const SERVER_URL = process.env.OBSERVABILITY_SERVER_URL || 'http://localhost:4000/events';
-const SOURCE_APP = process.env.OBSERVABILITY_SOURCE_APP || 'opencode-wardenn';
+
+/**
+ * Extract agent name from directory path
+ * e.g., /opt/wardenn/agents/state1.6-login -> state1.6-login
+ */
+function extractAgentName(directory) {
+  if (!directory) return 'opencode';
+
+  // Try to extract from Wardenn agent path pattern
+  const wardennMatch = directory.match(/\/agents\/([^\/]+)\/?$/);
+  if (wardennMatch) {
+    return wardennMatch[1];
+  }
+
+  // Try to extract from .opencode project path
+  const projectMatch = directory.match(/\/([^\/]+)\/?$/);
+  if (projectMatch) {
+    return projectMatch[1];
+  }
+
+  // Fallback to environment variable or default
+  return process.env.OBSERVABILITY_SOURCE_APP || 'opencode';
+}
 
 /**
  * Send event to observability server
  */
-async function sendEvent(eventType, payload, sessionId, modelName = '') {
+async function sendEvent(eventType, payload, sessionId, sourceApp, modelName = '') {
   try {
     const eventData = {
-      source_app: SOURCE_APP,
+      source_app: sourceApp,
       session_id: sessionId || 'unknown',
       hook_event_type: eventType,
       payload: payload,
@@ -39,31 +61,40 @@ async function sendEvent(eventType, payload, sessionId, modelName = '') {
     }
   } catch (error) {
     // Silently fail to not block OpenCode operations
-    console.error(`[Observability] Error sending event: ${error.message}`);
+    // Only log in debug mode
+    if (process.env.OBSERVABILITY_DEBUG) {
+      console.error(`[Observability] Error sending event: ${error.message}`);
+    }
   }
-}
-
-/**
- * Extract session ID from context
- */
-function getSessionId(context) {
-  // Try different ways to get session ID
-  if (context?.sessionId) return context.sessionId;
-  if (context?.session?.id) return context.session.id;
-  if (context?.id) return context.id;
-  // Generate a unique ID if none available
-  return `opencode-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 }
 
 /**
  * Main plugin export
  */
 export const ObservabilityPlugin = async ({ project, client, $, directory, worktree }) => {
-  // Store session ID for this instance
-  let currentSessionId = `opencode-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-  let currentModel = '';
+  // Extract agent name from directory path
+  const agentName = extractAgentName(directory);
 
-  console.log(`[Observability] Plugin loaded for project: ${project?.name || directory}`);
+  // Generate unique session ID for this run
+  const currentSessionId = `${agentName}-${Date.now()}-${Math.random().toString(36).substr(2, 8)}`;
+  let currentModel = process.env.OPENCODE_MODEL || 'anthropic/claude-opus-4-5';
+
+  console.log(`[Observability] Plugin loaded for agent: ${agentName}`);
+  console.log(`[Observability] Session ID: ${currentSessionId}`);
+  console.log(`[Observability] Server: ${SERVER_URL}`);
+
+  // Send initial SessionStart event
+  const initialPayload = {
+    session_id: currentSessionId,
+    agent_name: agentName,
+    model: currentModel,
+    cwd: directory,
+    project: project?.name || agentName,
+    created_at: Date.now()
+  };
+
+  // Fire SessionStart immediately when plugin loads
+  sendEvent('SessionStart', initialPayload, currentSessionId, agentName, currentModel);
 
   return {
     /**
@@ -74,10 +105,11 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
         tool_name: event.tool || event.name || 'unknown',
         tool_input: event.input || event.args || {},
         session_id: currentSessionId,
+        agent_name: agentName,
         cwd: directory
       };
 
-      await sendEvent('PreToolUse', payload, currentSessionId, currentModel);
+      await sendEvent('PreToolUse', payload, currentSessionId, agentName, currentModel);
     },
 
     /**
@@ -90,28 +122,31 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
         tool_output: event.output || event.result || '',
         tool_error: event.error || null,
         session_id: currentSessionId,
+        agent_name: agentName,
         duration_ms: event.duration || 0
       };
 
-      await sendEvent('PostToolUse', payload, currentSessionId, currentModel);
+      await sendEvent('PostToolUse', payload, currentSessionId, agentName, currentModel);
     },
 
     /**
      * Session created (maps to SessionStart)
      */
     "session.created": async (event) => {
-      currentSessionId = event.sessionId || event.id || currentSessionId;
-      currentModel = event.model || '';
+      if (event.model) {
+        currentModel = event.model;
+      }
 
       const payload = {
         session_id: currentSessionId,
+        agent_name: agentName,
         model: currentModel,
         cwd: directory,
-        project: project?.name || '',
+        project: project?.name || agentName,
         created_at: Date.now()
       };
 
-      await sendEvent('SessionStart', payload, currentSessionId, currentModel);
+      await sendEvent('SessionStart', payload, currentSessionId, agentName, currentModel);
     },
 
     /**
@@ -120,12 +155,13 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
     "session.idle": async (event) => {
       const payload = {
         session_id: currentSessionId,
+        agent_name: agentName,
         reason: 'idle',
         cwd: directory,
         stopped_at: Date.now()
       };
 
-      await sendEvent('Stop', payload, currentSessionId, currentModel);
+      await sendEvent('Stop', payload, currentSessionId, agentName, currentModel);
     },
 
     /**
@@ -134,12 +170,13 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
     "session.compacted": async (event) => {
       const payload = {
         session_id: currentSessionId,
+        agent_name: agentName,
         reason: event.reason || 'context_limit',
         tokens_before: event.tokensBefore || 0,
         tokens_after: event.tokensAfter || 0
       };
 
-      await sendEvent('PreCompact', payload, currentSessionId, currentModel);
+      await sendEvent('PreCompact', payload, currentSessionId, agentName, currentModel);
     },
 
     /**
@@ -150,11 +187,12 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
       if (event.role === 'user' || event.type === 'user') {
         const payload = {
           session_id: currentSessionId,
+          agent_name: agentName,
           message: event.content || event.text || '',
           role: event.role || 'user'
         };
 
-        await sendEvent('UserPromptSubmit', payload, currentSessionId, currentModel);
+        await sendEvent('UserPromptSubmit', payload, currentSessionId, agentName, currentModel);
       }
     },
 
@@ -164,12 +202,13 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
     "file.edited": async (event) => {
       const payload = {
         session_id: currentSessionId,
+        agent_name: agentName,
         file_path: event.path || event.file || '',
         changes: event.changes || [],
         tool_name: 'Edit'
       };
 
-      await sendEvent('PostToolUse', payload, currentSessionId, currentModel);
+      await sendEvent('PostToolUse', payload, currentSessionId, agentName, currentModel);
     },
 
     /**
@@ -178,12 +217,13 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
     "command.permission": async (event) => {
       const payload = {
         session_id: currentSessionId,
+        agent_name: agentName,
         command: event.command || '',
         allowed: event.allowed || false,
         tool_name: 'Bash'
       };
 
-      await sendEvent('Notification', payload, currentSessionId, currentModel);
+      await sendEvent('Notification', payload, currentSessionId, agentName, currentModel);
     }
   };
 };
