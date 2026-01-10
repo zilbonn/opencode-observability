@@ -75,8 +75,8 @@
     <LivePulseChart
       :events="events"
       :filters="filters"
-      @update-unique-apps="uniqueAppNames = $event"
-      @update-all-apps="allAppNames = $event"
+      @update-unique-apps="updateUniqueAppNames"
+      @update-all-apps="updateAllAppNames"
       @update-time-range="currentTimeRange = $event"
     />
 
@@ -174,6 +174,27 @@ const uniqueAppNames = ref<string[]>([]); // Apps active in current time window
 const allAppNames = ref<string[]>([]); // All apps ever seen in session
 const selectedAgentLanes = ref<string[]>([]);
 const currentTimeRange = ref<TimeRange>('1m'); // Current time range from LivePulseChart
+
+// Helper to compare arrays and only update if content actually changed
+const arraysEqual = (a: string[], b: string[]): boolean => {
+  if (a.length !== b.length) return false;
+  const sortedA = [...a].sort();
+  const sortedB = [...b].sort();
+  return sortedA.every((val, idx) => val === sortedB[idx]);
+};
+
+// Update handlers that prevent unnecessary re-renders
+const updateUniqueAppNames = (newNames: string[]) => {
+  if (!arraysEqual(uniqueAppNames.value, newNames)) {
+    uniqueAppNames.value = newNames;
+  }
+};
+
+const updateAllAppNames = (newNames: string[]) => {
+  if (!arraysEqual(allAppNames.value, newNames)) {
+    allAppNames.value = newNames;
+  }
+};
 
 // Toast notifications
 interface Toast {
