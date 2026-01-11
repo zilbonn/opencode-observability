@@ -1,3 +1,5 @@
+# ⚠️ THIS WAS NOT MADE BY ME THIS IS THE OPENCODE VERSION OF THIS REPO https://github.com/disler/claude-code-hooks-multi-agent-observability
+ 
 # OpenCode Multi-Agent Observability
 
 A plugin and dashboard for observing OpenCode agent activities in real-time. Compatible with the [claude-code-hooks-multi-agent-observability](https://github.com/disler/claude-code-hooks-multi-agent-observability) system.
