@@ -352,7 +352,33 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
     });
   };
 
-  // Record REAL token usage
+  // Token estimation constants (approximate)
+  const CHARS_PER_TOKEN = 4;
+  const MODEL_PRICING = {
+    // Anthropic pricing per 1M tokens
+    'anthropic/claude-opus-4-5': { input: 15, output: 75 },
+    'anthropic/claude-sonnet-4': { input: 3, output: 15 },
+    'anthropic/claude-3-5-sonnet': { input: 3, output: 15 },
+    'anthropic/claude-3-opus': { input: 15, output: 75 },
+    'default': { input: 3, output: 15 }
+  };
+
+  // Estimate tokens from text
+  const estimateTokens = (text) => {
+    if (!text) return 0;
+    const str = typeof text === 'string' ? text : JSON.stringify(text);
+    return Math.ceil(str.length / CHARS_PER_TOKEN);
+  };
+
+  // Estimate cost from tokens
+  const estimateCost = (inputTokens, outputTokens, modelName) => {
+    const pricing = MODEL_PRICING[modelName] || MODEL_PRICING['default'];
+    const inputCost = (inputTokens / 1000000) * pricing.input;
+    const outputCost = (outputTokens / 1000000) * pricing.output;
+    return inputCost + outputCost;
+  };
+
+  // Record REAL token usage (when available from message hooks)
   const recordRealTokenUsage = async (tokens, cost, modelName) => {
     if (!tokens) return;
 
@@ -386,6 +412,31 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
         reasoning_tokens: reasoningTokens,
         cache_read_tokens: cacheReadTokens,
         cache_write_tokens: cacheWriteTokens,
+        timestamp: Date.now()
+      });
+    }
+  };
+
+  // Record ESTIMATED token usage (fallback when message hooks don't fire)
+  const recordEstimatedTokenUsage = async (inputText, outputText) => {
+    const inputTokens = estimateTokens(inputText);
+    const outputTokens = estimateTokens(outputText);
+    const estimatedCost = estimateCost(inputTokens, outputTokens, currentModel);
+
+    totalInputTokens += inputTokens;
+    totalOutputTokens += outputTokens;
+    totalCost += estimatedCost;
+
+    if (inputTokens > 0 || outputTokens > 0) {
+      await sendMetric('/api/metrics/tokens', {
+        session_id: currentSessionId,
+        source_app: agentName,
+        model_name: currentModel,
+        input_tokens: inputTokens,
+        output_tokens: outputTokens,
+        total_tokens: inputTokens + outputTokens,
+        estimated_cost: estimatedCost,
+        is_estimate: true,
         timestamp: Date.now()
       });
     }
@@ -473,6 +524,11 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
       for (const finding of findings) {
         await recordFinding(finding);
       }
+
+      // Estimate tokens from tool I/O (fallback since message hooks don't fire in OpenCode 1.1.x)
+      const inputStr = cachedArgs ? JSON.stringify(cachedArgs) : '';
+      const outputStr = typeof output === 'string' ? output : (output ? JSON.stringify(output) : '');
+      await recordEstimatedTokenUsage(inputStr, outputStr);
 
       if (totalToolCalls % 10 === 0) {
         await updateSession();
