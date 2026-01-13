@@ -564,291 +564,286 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
     },
 
     /**
-     * Session events
+     * Universal event handler - receives ALL OpenCode events
+     * Event structure: { type: string, properties: object }
+     *
+     * According to OpenCode SDK types:
+     * - message.updated: properties.info contains Message (with tokens, cost)
+     * - message.part.updated: properties.part contains Part (StepFinishPart has tokens)
+     * - session.idle, session.error, etc.
      */
-    "session.created": async (event) => {
-      await sendEvent('SessionStart', {
-        session_id: currentSessionId,
-        cwd: directory,
-        project_name: project?.name || agentName
-      }, currentSessionId, agentName, currentModel);
-    },
-
-    "session.idle": async (event) => {
-      await updateSession('completed');
-      await sendEvent('Stop', {
-        session_id: currentSessionId,
-        stop_reason: 'idle',
-        total_cost: totalCost,
-        total_tokens: totalInputTokens + totalOutputTokens + totalReasoningTokens,
-        total_tool_calls: totalToolCalls,
-        total_errors: totalErrors,
-        total_retries: totalRetries,
-        agents_used: Array.from(agentsUsed),
-        models_used: Array.from(modelsUsed),
-        cwd: directory
-      }, currentSessionId, agentName, currentModel);
-    },
-
-    "session.updated": async (session) => {
+    event: async ({ event }) => {
       if (process.env.OBSERVABILITY_DEBUG) {
-        console.log('[Observability] session.updated:', session?.id);
+        console.log('[Observability] Event received:', event?.type);
       }
-      // Track session title/metadata updates
-      if (session?.title) {
-        await sendEvent('SessionUpdate', {
+
+      const eventType = event?.type;
+      const props = event?.properties || {};
+
+      // ===== SESSION EVENTS =====
+      if (eventType === 'session.created') {
+        await sendEvent('SessionStart', {
           session_id: currentSessionId,
-          title: session.title,
-          time_updated: session?.time?.updated
-        }, currentSessionId, agentName, currentModel);
-      }
-    },
-
-    "session.error": async (error) => {
-      totalErrors++;
-      const errorType = error?.type || error?.name || 'unknown';
-      errorTypes[errorType] = (errorTypes[errorType] || 0) + 1;
-
-      await sendEvent('SessionError', {
-        session_id: currentSessionId,
-        error_type: errorType,
-        error_message: error?.message || String(error),
-        total_errors: totalErrors
-      }, currentSessionId, agentName, currentModel);
-    },
-
-    /**
-     * Message updated - REAL token data + latency + errors
-     */
-    "message.updated": async (message) => {
-      if (process.env.OBSERVABILITY_DEBUG) {
-        console.log('[Observability] message.updated type:', message?.role || message?.type);
-      }
-
-      // User messages
-      if (message?.role === 'user' || message?.type === 'user') {
-        const messageContent = message?.content || message?.text || message?.message || '';
-        const promptText = typeof messageContent === 'string' ? messageContent : JSON.stringify(messageContent);
-
-        await sendEvent('UserPromptSubmit', {
-          session_id: currentSessionId,
-          prompt: promptText
+          cwd: directory,
+          project_name: project?.name || agentName
         }, currentSessionId, agentName, currentModel);
       }
 
-      // Assistant messages - tokens, cost, latency, errors
-      if (message?.role === 'assistant' || message?.type === 'assistant') {
-        const messageId = message?.id || `msg-${Date.now()}`;
+      if (eventType === 'session.idle') {
+        await updateSession('completed');
+        await sendEvent('Stop', {
+          session_id: currentSessionId,
+          stop_reason: 'idle',
+          total_cost: totalCost,
+          total_tokens: totalInputTokens + totalOutputTokens + totalReasoningTokens,
+          total_tool_calls: totalToolCalls,
+          total_errors: totalErrors,
+          total_retries: totalRetries,
+          agents_used: Array.from(agentsUsed),
+          models_used: Array.from(modelsUsed),
+          cwd: directory
+        }, currentSessionId, agentName, currentModel);
+      }
 
-        if (!recordedIds.has(messageId)) {
-          recordedIds.add(messageId);
-          messageCount++;
-
-          // Record tokens and cost
-          if (message?.tokens) {
-            await recordRealTokenUsage(message.tokens, message.cost, message.modelID || message.model);
-          }
-
-          // Calculate latency
-          let latencyMs = null;
-          if (message?.time?.created && message?.time?.completed) {
-            latencyMs = message.time.completed - message.time.created;
-            totalLatencyMs += latencyMs;
-          }
-
-          // Track model used
-          if (message?.modelID) modelsUsed.add(message.modelID);
-          if (message?.providerID) modelsUsed.add(`${message.providerID}/${message.modelID}`);
-
-          // Handle errors
-          if (message?.error) {
-            totalErrors++;
-            const errorType = message.error.type || message.error.name || 'unknown';
-            errorTypes[errorType] = (errorTypes[errorType] || 0) + 1;
-
-            await sendEvent('MessageError', {
-              session_id: currentSessionId,
-              message_id: messageId,
-              error_type: errorType,
-              error_message: message.error.message || String(message.error),
-              // Specific error types from OpenCode
-              is_auth_error: errorType === 'ProviderAuthError',
-              is_api_error: errorType === 'ApiError',
-              is_abort_error: errorType === 'MessageAbortedError',
-              is_length_error: errorType === 'MessageOutputLengthError'
-            }, currentSessionId, agentName, currentModel);
-          }
-
-          // Send message completion event with all data
-          await sendEvent('MessageComplete', {
+      if (eventType === 'session.updated') {
+        const session = props.session || props;
+        if (session?.title) {
+          await sendEvent('SessionUpdate', {
             session_id: currentSessionId,
-            message_id: messageId,
-            model: message?.modelID,
-            provider: message?.providerID,
-            latency_ms: latencyMs,
-            finish_reason: message?.finish,
-            cost: message?.cost,
-            tokens: message?.tokens,
-            has_error: !!message?.error
+            title: session.title,
+            time_updated: session?.time?.updated
           }, currentSessionId, agentName, currentModel);
         }
       }
-    },
 
-    /**
-     * Message part updated - reasoning, tool states, retries, agents
-     */
-    "message.part.updated": async (part) => {
-      if (process.env.OBSERVABILITY_DEBUG) {
-        console.log('[Observability] message.part.updated type:', part?.type);
-      }
+      if (eventType === 'session.error') {
+        const error = props.error || props;
+        totalErrors++;
+        const errType = error?.type || error?.name || 'unknown';
+        errorTypes[errType] = (errorTypes[errType] || 0) + 1;
 
-      const partId = part?.id || `part-${Date.now()}-${Math.random()}`;
-      if (recordedIds.has(partId)) return;
-
-      // StepFinishPart - tokens and cost
-      if (part?.type === 'step-finish' && part?.tokens) {
-        recordedIds.add(partId);
-        await recordRealTokenUsage(part.tokens, part.cost, part.model);
-
-        await sendEvent('StepFinish', {
+        await sendEvent('SessionError', {
           session_id: currentSessionId,
-          part_id: partId,
-          reason: part.reason,
-          cost: part.cost,
-          tokens: part.tokens
+          error_type: errType,
+          error_message: error?.message || String(error),
+          total_errors: totalErrors
         }, currentSessionId, agentName, currentModel);
       }
 
-      // ReasoningPart - thinking time
-      if (part?.type === 'reasoning') {
-        recordedIds.add(partId);
-        let reasoningTimeMs = null;
-        if (part?.time?.start && part?.time?.end) {
-          reasoningTimeMs = part.time.end - part.time.start;
-          totalReasoningTimeMs += reasoningTimeMs;
+      // ===== MESSAGE EVENTS - REAL TOKEN DATA =====
+      if (eventType === 'message.updated') {
+        // According to SDK types: EventMessageUpdated.properties.info contains Message
+        const message = props.info || props;
+
+        if (process.env.OBSERVABILITY_DEBUG) {
+          console.log('[Observability] message.updated - role:', message?.role, 'tokens:', message?.tokens);
         }
 
-        await sendEvent('Reasoning', {
+        // User messages
+        if (message?.role === 'user') {
+          const messageContent = message?.content || message?.text || '';
+          const promptText = typeof messageContent === 'string' ? messageContent : JSON.stringify(messageContent);
+
+          await sendEvent('UserPromptSubmit', {
+            session_id: currentSessionId,
+            prompt: promptText
+          }, currentSessionId, agentName, currentModel);
+        }
+
+        // Assistant messages - REAL tokens, cost, latency, errors
+        if (message?.role === 'assistant') {
+          const messageId = message?.id || `msg-${Date.now()}`;
+
+          if (!recordedIds.has(messageId)) {
+            recordedIds.add(messageId);
+            messageCount++;
+
+            // Record REAL tokens and cost from AssistantMessage
+            if (message?.tokens) {
+              if (process.env.OBSERVABILITY_DEBUG) {
+                console.log('[Observability] Recording REAL tokens:', message.tokens, 'cost:', message.cost);
+              }
+              await recordRealTokenUsage(message.tokens, message.cost, message.modelID);
+            }
+
+            // Calculate latency
+            let latencyMs = null;
+            if (message?.time?.created && message?.time?.completed) {
+              latencyMs = message.time.completed - message.time.created;
+              totalLatencyMs += latencyMs;
+            }
+
+            // Track model used
+            if (message?.modelID) modelsUsed.add(message.modelID);
+            if (message?.providerID) modelsUsed.add(`${message.providerID}/${message.modelID}`);
+
+            // Handle errors
+            if (message?.error) {
+              totalErrors++;
+              const errType = message.error.type || message.error.name || 'unknown';
+              errorTypes[errType] = (errorTypes[errType] || 0) + 1;
+
+              await sendEvent('MessageError', {
+                session_id: currentSessionId,
+                message_id: messageId,
+                error_type: errType,
+                error_message: message.error.message || String(message.error),
+                is_auth_error: errType === 'ProviderAuthError',
+                is_api_error: errType === 'ApiError',
+                is_abort_error: errType === 'MessageAbortedError',
+                is_length_error: errType === 'MessageOutputLengthError'
+              }, currentSessionId, agentName, currentModel);
+            }
+
+            // Send message completion event
+            await sendEvent('MessageComplete', {
+              session_id: currentSessionId,
+              message_id: messageId,
+              model: message?.modelID,
+              provider: message?.providerID,
+              latency_ms: latencyMs,
+              finish_reason: message?.finish,
+              cost: message?.cost,
+              tokens: message?.tokens,
+              has_error: !!message?.error
+            }, currentSessionId, agentName, currentModel);
+          }
+        }
+      }
+
+      // ===== MESSAGE PART EVENTS - StepFinish has tokens =====
+      if (eventType === 'message.part.updated') {
+        // According to SDK types: EventMessagePartUpdated.properties.part contains Part
+        const part = props.part || props;
+
+        if (process.env.OBSERVABILITY_DEBUG) {
+          console.log('[Observability] message.part.updated - type:', part?.type);
+        }
+
+        const partId = part?.id || `part-${Date.now()}-${Math.random()}`;
+        if (recordedIds.has(partId)) return;
+
+        // StepFinishPart - contains REAL tokens and cost
+        if (part?.type === 'step-finish' && part?.tokens) {
+          recordedIds.add(partId);
+          if (process.env.OBSERVABILITY_DEBUG) {
+            console.log('[Observability] StepFinish tokens:', part.tokens, 'cost:', part.cost);
+          }
+          await recordRealTokenUsage(part.tokens, part.cost, null);
+
+          await sendEvent('StepFinish', {
+            session_id: currentSessionId,
+            part_id: partId,
+            reason: part.reason,
+            cost: part.cost,
+            tokens: part.tokens
+          }, currentSessionId, agentName, currentModel);
+        }
+
+        // ReasoningPart - thinking time
+        if (part?.type === 'reasoning') {
+          recordedIds.add(partId);
+          let reasoningTimeMs = null;
+          if (part?.time?.start && part?.time?.end) {
+            reasoningTimeMs = part.time.end - part.time.start;
+            totalReasoningTimeMs += reasoningTimeMs;
+          }
+
+          await sendEvent('Reasoning', {
+            session_id: currentSessionId,
+            part_id: partId,
+            reasoning_time_ms: reasoningTimeMs,
+            text_length: part?.text?.length || 0
+          }, currentSessionId, agentName, currentModel);
+        }
+
+        // ToolPart - tool state transitions
+        if (part?.type === 'tool' && part?.state) {
+          const state = part.state;
+
+          await sendEvent('ToolState', {
+            session_id: currentSessionId,
+            part_id: partId,
+            tool: part.tool,
+            call_id: part.callID,
+            status: state.status,
+            title: state.title,
+            has_error: state.status === 'error',
+            error_message: state.error,
+            duration_ms: state.time?.start && state.time?.end ? state.time.end - state.time.start : null
+          }, currentSessionId, agentName, currentModel);
+        }
+
+        // RetryPart - track retries
+        if (part?.type === 'retry') {
+          recordedIds.add(partId);
+          totalRetries++;
+
+          await sendEvent('Retry', {
+            session_id: currentSessionId,
+            part_id: partId,
+            attempt: part.attempt,
+            error_type: part.error?.type || 'unknown',
+            error_message: part.error?.message,
+            total_retries: totalRetries
+          }, currentSessionId, agentName, currentModel);
+        }
+
+        // AgentPart - track agent spawns
+        if (part?.type === 'agent') {
+          recordedIds.add(partId);
+          const spawnedAgent = part.name || 'unknown';
+          agentsUsed.add(spawnedAgent);
+
+          await sendEvent('AgentSpawn', {
+            session_id: currentSessionId,
+            part_id: partId,
+            agent_name: spawnedAgent,
+            source: part.source,
+            agents_used: Array.from(agentsUsed)
+          }, currentSessionId, agentName, currentModel);
+        }
+      }
+
+      // ===== PERMISSION EVENTS =====
+      if (eventType === 'permission.updated') {
+        const permission = props;
+        await sendEvent('PermissionRequest', {
           session_id: currentSessionId,
-          part_id: partId,
-          reasoning_time_ms: reasoningTimeMs,
-          text_length: part?.text?.length || 0
+          permission_type: permission?.type,
+          tool: permission?.tool,
+          action: permission?.action
         }, currentSessionId, agentName, currentModel);
       }
 
-      // ToolPart - tool state transitions
-      if (part?.type === 'tool' && part?.state) {
-        const state = part.state;
-
-        await sendEvent('ToolState', {
+      if (eventType === 'permission.replied') {
+        const permission = props;
+        await sendEvent('PermissionResponse', {
           session_id: currentSessionId,
-          part_id: partId,
-          tool: part.tool,
-          call_id: part.callID,
-          status: state.status,
-          title: state.title,
-          has_error: state.status === 'error',
-          error_message: state.error,
-          start_time: state.time?.start,
-          end_time: state.time?.end,
-          duration_ms: state.time?.start && state.time?.end ? state.time.end - state.time.start : null
+          permission_type: permission?.type,
+          tool: permission?.tool,
+          allowed: permission?.allowed,
+          response: permission?.response
         }, currentSessionId, agentName, currentModel);
       }
 
-      // RetryPart - track retries
-      if (part?.type === 'retry') {
-        recordedIds.add(partId);
-        totalRetries++;
-
-        await sendEvent('Retry', {
+      // ===== FILE EVENTS =====
+      if (eventType === 'file.edited') {
+        await sendEvent('FileEdit', {
           session_id: currentSessionId,
-          part_id: partId,
-          attempt: part.attempt,
-          error_type: part.error?.type || 'unknown',
-          error_message: part.error?.message,
-          retry_time: part.time,
-          total_retries: totalRetries
+          file_path: props?.path || props?.file || ''
         }, currentSessionId, agentName, currentModel);
       }
 
-      // AgentPart - track agent spawns
-      if (part?.type === 'agent') {
-        recordedIds.add(partId);
-        const spawnedAgent = part.name || 'unknown';
-        agentsUsed.add(spawnedAgent);
-
-        await sendEvent('AgentSpawn', {
+      // ===== TODO EVENTS =====
+      if (eventType === 'todo.updated') {
+        const todos = props?.todos || props;
+        await sendEvent('TodoUpdate', {
           session_id: currentSessionId,
-          part_id: partId,
-          agent_name: spawnedAgent,
-          source: part.source,
-          agents_used: Array.from(agentsUsed)
+          todo_count: Array.isArray(todos) ? todos.length : 0,
+          todos: Array.isArray(todos) ? todos.slice(0, 10) : []
         }, currentSessionId, agentName, currentModel);
       }
-    },
-
-    /**
-     * Permission events
-     */
-    "permission.updated": async (permission) => {
-      await sendEvent('PermissionRequest', {
-        session_id: currentSessionId,
-        permission_type: permission?.type,
-        tool: permission?.tool,
-        action: permission?.action
-      }, currentSessionId, agentName, currentModel);
-    },
-
-    "permission.replied": async (permission) => {
-      await sendEvent('PermissionResponse', {
-        session_id: currentSessionId,
-        permission_type: permission?.type,
-        tool: permission?.tool,
-        allowed: permission?.allowed,
-        response: permission?.response
-      }, currentSessionId, agentName, currentModel);
-    },
-
-    /**
-     * File edited
-     */
-    "file.edited": async (event) => {
-      await sendEvent('FileEdit', {
-        session_id: currentSessionId,
-        file_path: event?.path || event?.file || ''
-      }, currentSessionId, agentName, currentModel);
-    },
-
-    /**
-     * Todo updated
-     */
-    "todo.updated": async (todos) => {
-      await sendEvent('TodoUpdate', {
-        session_id: currentSessionId,
-        todo_count: Array.isArray(todos) ? todos.length : 0,
-        todos: Array.isArray(todos) ? todos.slice(0, 10) : []
-      }, currentSessionId, agentName, currentModel);
-    },
-
-    /**
-     * Error occurred
-     */
-    "error": async (event) => {
-      totalErrors++;
-      const errorType = event?.type || event?.name || 'unknown';
-      errorTypes[errorType] = (errorTypes[errorType] || 0) + 1;
-
-      await updateSession('failed');
-
-      await sendEvent('Error', {
-        session_id: currentSessionId,
-        error_type: errorType,
-        error_message: event?.message || event?.error || 'Unknown error',
-        total_errors: totalErrors,
-        error_types: errorTypes,
-        cwd: directory
-      }, currentSessionId, agentName, currentModel);
     }
   };
 };
