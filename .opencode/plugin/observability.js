@@ -5,7 +5,7 @@
  * Compatible with the claude-code-hooks-multi-agent-observability system.
  *
  * METRICS TRACKING:
- * - Token usage (estimated from tool output lengths)
+ * - Token usage (REAL data from OpenCode message.updated / message.part.updated hooks)
  * - Tool effectiveness (duration, success/failure, vulnerabilities found)
  * - Security findings (parsed from Bash tool outputs - nuclei, security scanners)
  * - WSTG coverage (tracked when WSTG MCP tools are used)
@@ -14,21 +14,6 @@
 
 const SERVER_URL = process.env.OBSERVABILITY_SERVER_URL || 'http://localhost:4000/events';
 const METRICS_BASE_URL = process.env.OBSERVABILITY_METRICS_URL || 'http://localhost:4000';
-
-// Model cost estimates per 1M tokens (input/output)
-const MODEL_COSTS = {
-  'claude-opus-4': { input: 15.00, output: 75.00 },
-  'claude-opus-4-5': { input: 15.00, output: 75.00 },
-  'anthropic/claude-opus-4': { input: 15.00, output: 75.00 },
-  'anthropic/claude-opus-4-5': { input: 15.00, output: 75.00 },
-  'claude-sonnet-4': { input: 3.00, output: 15.00 },
-  'anthropic/claude-sonnet-4': { input: 3.00, output: 15.00 },
-  'claude-haiku-3.5': { input: 0.80, output: 4.00 },
-  'anthropic/claude-haiku-3.5': { input: 0.80, output: 4.00 },
-  'claude-3-opus': { input: 15.00, output: 75.00 },
-  'claude-3-sonnet': { input: 3.00, output: 15.00 },
-  'claude-3-haiku': { input: 0.25, output: 1.25 },
-};
 
 // Severity patterns for finding detection
 const SEVERITY_PATTERNS = {
@@ -65,9 +50,6 @@ const WSTG_PATTERNS = {
 
 // Tools that should be scanned for security findings
 const SECURITY_SCAN_TOOLS = ['Bash', 'bash'];
-
-// Tools that should NOT be scanned (file operations, search, etc.)
-const SKIP_SCAN_TOOLS = ['Read', 'read', 'Write', 'write', 'Edit', 'edit', 'Glob', 'glob', 'Grep', 'grep', 'TodoWrite', 'todowrite'];
 
 /**
  * Extract agent name from directory path
@@ -114,7 +96,6 @@ function parseNucleiOutput(output) {
 
   while ((match = nucleiPattern.exec(output)) !== null) {
     const [, severity, templateId, protocol, target] = match;
-    // Only count actual severity levels, not info tags
     const sevLower = severity.toLowerCase();
     if (['critical', 'high', 'medium', 'low', 'info'].includes(sevLower)) {
       findings.push({
@@ -137,7 +118,6 @@ function detectFindings(toolName, output) {
   const findings = [];
   if (!output) return findings;
 
-  // Only scan security-related tools
   if (!SECURITY_SCAN_TOOLS.includes(toolName)) {
     return findings;
   }
@@ -176,20 +156,11 @@ function detectFindings(toolName, output) {
         tool_used: toolName,
         confidence: 'confirmed',
       });
-      break; // Only report first match per output
+      break;
     }
   }
 
   return findings;
-}
-
-/**
- * Estimate tokens from text length (rough approximation: ~4 chars per token)
- */
-function estimateTokens(text) {
-  if (!text) return 0;
-  const str = typeof text === 'string' ? text : JSON.stringify(text);
-  return Math.ceil(str.length / 4);
 }
 
 /**
@@ -261,7 +232,7 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
 
   console.log(`[Observability] Plugin loaded for agent: ${agentName}`);
   console.log(`[Observability] Session ID: ${currentSessionId}`);
-  console.log(`[Observability] Metrics tracking enabled`);
+  console.log(`[Observability] Real token tracking enabled`);
 
   // Cache for tracking tool execution timing and args
   const toolTimingCache = new Map();
@@ -273,8 +244,15 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
   let findingCounter = 0;
   let totalInputTokens = 0;
   let totalOutputTokens = 0;
+  let totalReasoningTokens = 0;
+  let totalCacheReadTokens = 0;
+  let totalCacheWriteTokens = 0;
+  let totalCost = 0;
   const wstgCoverage = new Set();
   const agentsUsed = new Set([agentName]);
+
+  // Track which message IDs we've already recorded tokens for (to avoid duplicates)
+  const recordedMessageIds = new Set();
 
   // Create session on startup
   const createSession = async () => {
@@ -368,26 +346,47 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
     });
   };
 
-  // Record token usage
-  const recordTokenUsage = async (inputTokens, outputTokens) => {
+  // Record REAL token usage from OpenCode message data
+  const recordRealTokenUsage = async (tokens, cost, modelName) => {
+    if (!tokens) return;
+
+    const inputTokens = tokens.input || 0;
+    const outputTokens = tokens.output || 0;
+    const reasoningTokens = tokens.reasoning || 0;
+    const cacheReadTokens = tokens.cache?.read || 0;
+    const cacheWriteTokens = tokens.cache?.write || 0;
+    const actualCost = cost || 0;
+
+    // Update totals
     totalInputTokens += inputTokens;
     totalOutputTokens += outputTokens;
+    totalReasoningTokens += reasoningTokens;
+    totalCacheReadTokens += cacheReadTokens;
+    totalCacheWriteTokens += cacheWriteTokens;
+    totalCost += actualCost;
 
-    const modelKey = Object.keys(MODEL_COSTS).find(k => currentModel.includes(k)) || 'claude-opus-4';
-    const costs = MODEL_COSTS[modelKey] || { input: 15.00, output: 75.00 };
+    const totalTokensThisMessage = inputTokens + outputTokens + reasoningTokens;
 
-    const estimatedCost = (inputTokens * costs.input / 1000000) + (outputTokens * costs.output / 1000000);
+    if (totalTokensThisMessage > 0 || actualCost > 0) {
+      await sendMetric('/api/metrics/tokens', {
+        session_id: currentSessionId,
+        source_app: agentName,
+        model_name: modelName || currentModel,
+        input_tokens: inputTokens,
+        output_tokens: outputTokens,
+        total_tokens: totalTokensThisMessage,
+        estimated_cost: actualCost,
+        // Extended token data
+        reasoning_tokens: reasoningTokens,
+        cache_read_tokens: cacheReadTokens,
+        cache_write_tokens: cacheWriteTokens,
+        timestamp: Date.now()
+      });
 
-    await sendMetric('/api/metrics/tokens', {
-      session_id: currentSessionId,
-      source_app: agentName,
-      model_name: currentModel,
-      input_tokens: inputTokens,
-      output_tokens: outputTokens,
-      total_tokens: inputTokens + outputTokens,
-      estimated_cost: estimatedCost,
-      timestamp: Date.now()
-    });
+      if (process.env.OBSERVABILITY_DEBUG) {
+        console.log(`[Observability] Recorded REAL tokens: in=${inputTokens}, out=${outputTokens}, reasoning=${reasoningTokens}, cost=$${actualCost.toFixed(6)}`);
+      }
+    }
   };
 
   // Initialize session
@@ -417,9 +416,6 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
         toolTimingCache.set(callID, Date.now());
         argsCache.set(callID, toolArgs);
       }
-
-      // Estimate input tokens from args
-      const inputTokens = estimateTokens(toolArgs);
 
       // Build tool_input
       const toolInput = {};
@@ -473,15 +469,6 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
       const cachedArgs = callID ? argsCache.get(callID) : null;
       if (callID) {
         argsCache.delete(callID);
-      }
-
-      // Estimate tokens from input (args) and output
-      const inputTokens = estimateTokens(cachedArgs);
-      const outputTokens = estimateTokens(output);
-
-      // Record token usage for each tool call
-      if (inputTokens > 0 || outputTokens > 0) {
-        await recordTokenUsage(inputTokens, outputTokens);
       }
 
       // Determine success/failure
@@ -574,17 +561,64 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
     },
 
     /**
-     * Message updated
+     * Message updated - REAL token data from OpenCode
+     *
+     * AssistantMessage contains:
+     * - tokens.input: number
+     * - tokens.output: number
+     * - tokens.reasoning: number (for extended thinking)
+     * - tokens.cache.read: number
+     * - tokens.cache.write: number
+     * - cost: number
      */
-    "message.updated": async (event) => {
-      if (event?.role === 'user' || event?.type === 'user') {
-        const messageContent = event?.content || event?.text || event?.message || '';
+    "message.updated": async (message) => {
+      if (process.env.OBSERVABILITY_DEBUG) {
+        console.log('[Observability] message.updated:', JSON.stringify(message, null, 2).slice(0, 500));
+      }
+
+      // Handle user messages
+      if (message?.role === 'user' || message?.type === 'user') {
+        const messageContent = message?.content || message?.text || message?.message || '';
         const promptText = typeof messageContent === 'string' ? messageContent : JSON.stringify(messageContent);
 
         await sendEvent('UserPromptSubmit', {
           session_id: currentSessionId,
           prompt: promptText
         }, currentSessionId, agentName, currentModel);
+      }
+
+      // Handle assistant messages with REAL token data
+      if (message?.role === 'assistant' || message?.type === 'assistant') {
+        // Check if this message has token data
+        if (message?.tokens) {
+          // Use message ID to avoid duplicate recording
+          const messageId = message?.id || `${Date.now()}-${Math.random()}`;
+          if (!recordedMessageIds.has(messageId)) {
+            recordedMessageIds.add(messageId);
+            await recordRealTokenUsage(message.tokens, message.cost, message.model);
+          }
+        }
+      }
+    },
+
+    /**
+     * Message part updated - for StepFinishPart with token data
+     *
+     * StepFinishPart contains same token structure as AssistantMessage
+     */
+    "message.part.updated": async (part) => {
+      if (process.env.OBSERVABILITY_DEBUG) {
+        console.log('[Observability] message.part.updated:', JSON.stringify(part, null, 2).slice(0, 500));
+      }
+
+      // Check if this part has token data (StepFinishPart)
+      if (part?.tokens) {
+        // Use part ID to avoid duplicate recording
+        const partId = part?.id || `part-${Date.now()}-${Math.random()}`;
+        if (!recordedMessageIds.has(partId)) {
+          recordedMessageIds.add(partId);
+          await recordRealTokenUsage(part.tokens, part.cost, part.model);
+        }
       }
     },
 
