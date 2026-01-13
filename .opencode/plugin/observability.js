@@ -4,13 +4,10 @@
  * Sends OpenCode events to the multi-agent observability server.
  * Compatible with the claude-code-hooks-multi-agent-observability system.
  *
- * Events are sent to http://localhost:4000/events in the same format
- * as Claude Code hooks, allowing both tools to use the same dashboard.
- *
  * METRICS TRACKING:
- * - Token usage (estimated from model responses)
+ * - Token usage (estimated from tool output lengths)
  * - Tool effectiveness (duration, success/failure, vulnerabilities found)
- * - Security findings (parsed from tool outputs)
+ * - Security findings (parsed from Bash tool outputs - nuclei, security scanners)
  * - WSTG coverage (tracked when WSTG MCP tools are used)
  * - Session management (lifecycle tracking)
  */
@@ -42,38 +39,35 @@ const SEVERITY_PATTERNS = {
   info: /info|severity:\s*info/i,
 };
 
-// Vulnerability type patterns
+// Vulnerability type patterns - only match clear indicators from security tools
 const VULN_PATTERNS = {
-  'SQL Injection': /sql\s*injection|sqli|' or |" or |union\s+select/i,
-  'XSS': /cross.site\s*scripting|xss|<script|javascript:/i,
-  'Command Injection': /command\s*injection|os\s*injection|rce|remote\s*code/i,
-  'Path Traversal': /path\s*traversal|directory\s*traversal|\.\.\/|\.\.\\|lfi|local\s*file/i,
-  'SSRF': /ssrf|server.side\s*request/i,
-  'XXE': /xxe|xml\s*external\s*entity/i,
-  'IDOR': /idor|insecure\s*direct\s*object/i,
-  'Authentication Bypass': /auth.*bypass|authentication\s*bypass/i,
-  'Information Disclosure': /information\s*disclosure|sensitive\s*data|exposed/i,
-  'CSRF': /csrf|cross.site\s*request\s*forgery/i,
-  'Open Redirect': /open\s*redirect|url\s*redirect/i,
-  'Security Misconfiguration': /misconfiguration|misconfig|default\s*credential/i,
+  'SQL Injection': /\[sql.?injection\]|\[sqli\]|SQL Injection confirmed|vulnerable to SQL/i,
+  'XSS': /\[xss\]|\[cross.site.scripting\]|XSS confirmed|vulnerable to XSS/i,
+  'Command Injection': /\[command.?injection\]|\[rce\]|\[os.?injection\]|RCE confirmed/i,
+  'Path Traversal': /\[path.?traversal\]|\[lfi\]|\[directory.?traversal\]|LFI confirmed/i,
+  'SSRF': /\[ssrf\]|SSRF confirmed|server.side request forgery confirmed/i,
+  'XXE': /\[xxe\]|XXE confirmed|XML external entity confirmed/i,
+  'IDOR': /\[idor\]|IDOR confirmed|insecure direct object/i,
+  'Open Redirect': /\[open.?redirect\]|open redirect confirmed/i,
 };
 
 // WSTG ID patterns
 const WSTG_PATTERNS = {
-  'WSTG-INPV-05': /sql\s*injection|sqli/i,
-  'WSTG-INPV-01': /reflected.*xss|xss/i,
-  'WSTG-INPV-02': /stored.*xss/i,
-  'WSTG-INPV-12': /command\s*injection/i,
-  'WSTG-ATHZ-01': /path\s*traversal|directory\s*traversal/i,
+  'WSTG-INPV-05': /sql.?injection|sqli/i,
+  'WSTG-INPV-01': /xss|cross.site.scripting/i,
+  'WSTG-INPV-12': /command.?injection|rce/i,
+  'WSTG-ATHZ-01': /path.?traversal|directory.?traversal|lfi/i,
   'WSTG-INPV-19': /ssrf/i,
   'WSTG-INPV-07': /xxe/i,
   'WSTG-ATHZ-04': /idor/i,
-  'WSTG-ATHN-04': /auth.*bypass/i,
-  'WSTG-INFO-02': /information\s*disclosure/i,
-  'WSTG-SESS-05': /csrf/i,
-  'WSTG-CLNT-04': /open\s*redirect/i,
-  'WSTG-CONF-06': /misconfiguration/i,
+  'WSTG-CLNT-04': /open.?redirect/i,
 };
+
+// Tools that should be scanned for security findings
+const SECURITY_SCAN_TOOLS = ['Bash', 'bash'];
+
+// Tools that should NOT be scanned (file operations, search, etc.)
+const SKIP_SCAN_TOOLS = ['Read', 'read', 'Write', 'write', 'Edit', 'edit', 'Glob', 'glob', 'Grep', 'grep', 'TodoWrite', 'todowrite'];
 
 /**
  * Extract agent name from directory path
@@ -120,40 +114,56 @@ function parseNucleiOutput(output) {
 
   while ((match = nucleiPattern.exec(output)) !== null) {
     const [, severity, templateId, protocol, target] = match;
-    findings.push({
-      severity: severity.toLowerCase(),
-      vulnerability_type: templateId,
-      target_url: target.trim(),
-      tool_used: 'nuclei',
-      confidence: 'confirmed',
-    });
+    // Only count actual severity levels, not info tags
+    const sevLower = severity.toLowerCase();
+    if (['critical', 'high', 'medium', 'low', 'info'].includes(sevLower)) {
+      findings.push({
+        severity: sevLower,
+        vulnerability_type: templateId,
+        target_url: target.trim(),
+        tool_used: 'nuclei',
+        confidence: 'confirmed',
+      });
+    }
   }
 
   return findings;
 }
 
 /**
- * Parse Caido findings from output
+ * Detect findings from Bash tool output only
  */
-function parseCaidoOutput(output) {
+function detectFindings(toolName, output) {
   const findings = [];
-  if (!output || typeof output !== 'string') return findings;
+  if (!output) return findings;
 
-  // Look for vulnerability indicators in Caido output
+  // Only scan security-related tools
+  if (!SECURITY_SCAN_TOOLS.includes(toolName)) {
+    return findings;
+  }
+
+  const outputStr = typeof output === 'string' ? output : JSON.stringify(output);
+
+  // Parse nuclei output first (most reliable)
+  const nucleiFindings = parseNucleiOutput(outputStr);
+  if (nucleiFindings.length > 0) {
+    return nucleiFindings;
+  }
+
+  // Generic vulnerability detection from security tool output
   for (const [vulnType, pattern] of Object.entries(VULN_PATTERNS)) {
-    if (pattern.test(output)) {
+    if (pattern.test(outputStr)) {
       let severity = 'medium';
       for (const [sev, sevPattern] of Object.entries(SEVERITY_PATTERNS)) {
-        if (sevPattern.test(output)) {
+        if (sevPattern.test(outputStr)) {
           severity = sev;
           break;
         }
       }
 
-      // Find matching WSTG ID
       let wstgId = null;
       for (const [id, wstgPattern] of Object.entries(WSTG_PATTERNS)) {
-        if (wstgPattern.test(vulnType) || wstgPattern.test(output)) {
+        if (wstgPattern.test(vulnType)) {
           wstgId = id;
           break;
         }
@@ -163,9 +173,10 @@ function parseCaidoOutput(output) {
         severity,
         vulnerability_type: vulnType,
         wstg_id: wstgId,
-        tool_used: 'caido',
-        confidence: 'possible',
+        tool_used: toolName,
+        confidence: 'confirmed',
       });
+      break; // Only report first match per output
     }
   }
 
@@ -173,57 +184,12 @@ function parseCaidoOutput(output) {
 }
 
 /**
- * Detect findings from any tool output
+ * Estimate tokens from text length (rough approximation: ~4 chars per token)
  */
-function detectFindings(toolName, output) {
-  const findings = [];
-  if (!output) return findings;
-
-  const outputStr = typeof output === 'string' ? output : JSON.stringify(output);
-
-  // Tool-specific parsing
-  if (toolName === 'Bash' && outputStr.includes('[')) {
-    // Could be nuclei output
-    findings.push(...parseNucleiOutput(outputStr));
-  }
-
-  if (toolName?.includes('caido')) {
-    findings.push(...parseCaidoOutput(outputStr));
-  }
-
-  // Generic vulnerability detection if no specific findings yet
-  if (findings.length === 0) {
-    for (const [vulnType, pattern] of Object.entries(VULN_PATTERNS)) {
-      if (pattern.test(outputStr)) {
-        let severity = 'medium';
-        for (const [sev, sevPattern] of Object.entries(SEVERITY_PATTERNS)) {
-          if (sevPattern.test(outputStr)) {
-            severity = sev;
-            break;
-          }
-        }
-
-        let wstgId = null;
-        for (const [id, wstgPattern] of Object.entries(WSTG_PATTERNS)) {
-          if (wstgPattern.test(vulnType)) {
-            wstgId = id;
-            break;
-          }
-        }
-
-        findings.push({
-          severity,
-          vulnerability_type: vulnType,
-          wstg_id: wstgId,
-          tool_used: toolName,
-          confidence: 'possible',
-        });
-        break; // Only report first match per output
-      }
-    }
-  }
-
-  return findings;
+function estimateTokens(text) {
+  if (!text) return 0;
+  const str = typeof text === 'string' ? text : JSON.stringify(text);
+  return Math.ceil(str.length / 4);
 }
 
 /**
@@ -297,7 +263,7 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
   console.log(`[Observability] Session ID: ${currentSessionId}`);
   console.log(`[Observability] Metrics tracking enabled`);
 
-  // Cache for tracking tool execution timing
+  // Cache for tracking tool execution timing and args
   const toolTimingCache = new Map();
   const argsCache = new Map();
 
@@ -305,6 +271,8 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
   let totalToolCalls = 0;
   let totalFindings = 0;
   let findingCounter = 0;
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
   const wstgCoverage = new Set();
   const agentsUsed = new Set([agentName]);
 
@@ -333,7 +301,7 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
       total_findings: totalFindings,
       total_tool_calls: totalToolCalls,
       agents_used: Array.from(agentsUsed),
-      wstg_coverage_pct: (wstgCoverage.size / 91) * 100, // 91 WSTG tests total
+      wstg_coverage_pct: (wstgCoverage.size / 91) * 100,
       ...(status !== 'running' ? { ended_at: Date.now() } : {})
     });
   };
@@ -379,30 +347,32 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
 
     await sendMetric('/api/metrics/findings', findingData);
 
-    // Track WSTG coverage if we have a WSTG ID
     if (finding.wstg_id) {
-      await recordWSTGCoverage(finding.wstg_id, 'executed', finding.vulnerability_type ? 1 : 0);
+      await recordWSTGCoverage(finding.wstg_id, 'executed', 1);
     }
   };
 
   // Record WSTG coverage
   const recordWSTGCoverage = async (wstgId, status = 'executed', findingsCount = 0) => {
-    if (wstgCoverage.has(wstgId)) return; // Already recorded
+    if (wstgCoverage.has(wstgId)) return;
     wstgCoverage.add(wstgId);
 
     await sendMetric('/api/metrics/wstg', {
       session_id: currentSessionId,
       source_app: agentName,
       wstg_id: wstgId,
-      wstg_name: null, // Could be looked up from WSTG database
+      wstg_name: null,
       status,
       findings_count: findingsCount,
       timestamp: Date.now()
     });
   };
 
-  // Record token usage (estimated)
+  // Record token usage
   const recordTokenUsage = async (inputTokens, outputTokens) => {
+    totalInputTokens += inputTokens;
+    totalOutputTokens += outputTokens;
+
     const modelKey = Object.keys(MODEL_COSTS).find(k => currentModel.includes(k)) || 'claude-opus-4';
     const costs = MODEL_COSTS[modelKey] || { input: 15.00, output: 75.00 };
 
@@ -423,7 +393,7 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
   // Initialize session
   await createSession();
 
-  // Send initial SessionStart event (existing behavior)
+  // Send initial SessionStart event
   sendEvent('SessionStart', {
     session_id: currentSessionId,
     cwd: directory,
@@ -447,6 +417,9 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
         toolTimingCache.set(callID, Date.now());
         argsCache.set(callID, toolArgs);
       }
+
+      // Estimate input tokens from args
+      const inputTokens = estimateTokens(toolArgs);
 
       // Build tool_input
       const toolInput = {};
@@ -475,7 +448,7 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
         }
       }
 
-      // Send existing PreToolUse event
+      // Send PreToolUse event
       await sendEvent('PreToolUse', {
         tool_name: toolName,
         tool_input: toolInput,
@@ -502,11 +475,20 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
         argsCache.delete(callID);
       }
 
+      // Estimate tokens from input (args) and output
+      const inputTokens = estimateTokens(cachedArgs);
+      const outputTokens = estimateTokens(output);
+
+      // Record token usage for each tool call
+      if (inputTokens > 0 || outputTokens > 0) {
+        await recordTokenUsage(inputTokens, outputTokens);
+      }
+
       // Determine success/failure
-      const hasError = metadata?.error || (typeof output === 'string' && output.includes('Error:'));
+      const hasError = metadata?.error || (typeof output === 'string' && output.startsWith('Error:'));
       const status = hasError ? 'failure' : 'success';
 
-      // Detect findings in output
+      // Detect findings only from security tools (Bash)
       const findings = detectFindings(toolName, output);
       const foundVuln = findings.length > 0;
 
@@ -557,7 +539,7 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
         }
       }
 
-      // Send existing PostToolUse event
+      // Send PostToolUse event
       await sendEvent('PostToolUse', {
         tool_name: toolName,
         tool_input: toolInput,
@@ -582,7 +564,6 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
      * Session idle/ended
      */
     "session.idle": async (event) => {
-      // Update session to completed
       await updateSession('completed');
 
       await sendEvent('Stop', {
@@ -593,32 +574,17 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
     },
 
     /**
-     * Message updated - track user prompts and estimate tokens
+     * Message updated
      */
     "message.updated": async (event) => {
       if (event?.role === 'user' || event?.type === 'user') {
         const messageContent = event?.content || event?.text || event?.message || '';
         const promptText = typeof messageContent === 'string' ? messageContent : JSON.stringify(messageContent);
 
-        // Estimate tokens (rough: ~4 chars per token)
-        const estimatedInputTokens = Math.ceil(promptText.length / 4);
-
         await sendEvent('UserPromptSubmit', {
           session_id: currentSessionId,
           prompt: promptText
         }, currentSessionId, agentName, currentModel);
-      }
-
-      // Track assistant responses for token estimation
-      if (event?.role === 'assistant' || event?.type === 'assistant') {
-        const responseContent = event?.content || event?.text || event?.message || '';
-        const responseText = typeof responseContent === 'string' ? responseContent : JSON.stringify(responseContent);
-
-        // Estimate tokens (rough: ~4 chars per token)
-        const estimatedInputTokens = Math.ceil(responseText.length / 8); // Assume input was ~half the response
-        const estimatedOutputTokens = Math.ceil(responseText.length / 4);
-
-        await recordTokenUsage(estimatedInputTokens, estimatedOutputTokens);
       }
     },
 
@@ -639,7 +605,6 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
      * Error occurred
      */
     "error": async (event) => {
-      // Update session status on error
       await updateSession('failed');
 
       await sendEvent('Error', {
@@ -651,5 +616,4 @@ export const ObservabilityPlugin = async ({ project, client, $, directory, workt
   };
 };
 
-// Default export for OpenCode
 export default ObservabilityPlugin;
