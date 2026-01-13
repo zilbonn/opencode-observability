@@ -1,5 +1,34 @@
-import { initDatabase, insertEvent, getFilterOptions, getRecentEvents, updateEventHITLResponse } from './db';
-import type { HookEvent, HumanInTheLoopResponse } from './types';
+import {
+  initDatabase,
+  insertEvent,
+  getFilterOptions,
+  getRecentEvents,
+  updateEventHITLResponse,
+  // Metrics imports
+  insertTokenMetric,
+  getTokenSummary,
+  insertToolMetric,
+  getToolEffectivenessReport,
+  insertFinding,
+  getFindingSummary,
+  getFindings,
+  insertWSTGCoverage,
+  getWSTGCoverageReport,
+  upsertSession,
+  getSession,
+  getSessions,
+  addAgentToSession,
+  getMetricsDashboard
+} from './db';
+import type {
+  HookEvent,
+  HumanInTheLoopResponse,
+  TokenMetric,
+  ToolMetric,
+  Finding,
+  WSTGCoverage,
+  SessionSummary
+} from './types';
 import { 
   createTheme, 
   updateThemeById, 
@@ -404,7 +433,280 @@ const server = Bun.serve({
         headers: { ...headers, 'Content-Type': 'application/json' }
       });
     }
-    
+
+    // =====================================================
+    // METRICS API ENDPOINTS
+    // =====================================================
+
+    // POST /api/metrics/tokens - Record token usage
+    if (url.pathname === '/api/metrics/tokens' && req.method === 'POST') {
+      try {
+        const metric: TokenMetric = await req.json();
+
+        if (!metric.session_id || !metric.source_app) {
+          return new Response(JSON.stringify({ error: 'Missing session_id or source_app' }), {
+            status: 400,
+            headers: { ...headers, 'Content-Type': 'application/json' }
+          });
+        }
+
+        const saved = insertTokenMetric(metric);
+
+        // Broadcast to dashboard
+        const message = JSON.stringify({ type: 'token_update', data: saved });
+        wsClients.forEach(client => {
+          try { client.send(message); } catch (err) { wsClients.delete(client); }
+        });
+
+        return new Response(JSON.stringify(saved), {
+          headers: { ...headers, 'Content-Type': 'application/json' }
+        });
+      } catch (error) {
+        console.error('Error recording token metric:', error);
+        return new Response(JSON.stringify({ error: 'Invalid request' }), {
+          status: 400,
+          headers: { ...headers, 'Content-Type': 'application/json' }
+        });
+      }
+    }
+
+    // GET /api/metrics/tokens - Get token summary
+    if (url.pathname === '/api/metrics/tokens' && req.method === 'GET') {
+      const sessionId = url.searchParams.get('session_id') || undefined;
+      const summary = getTokenSummary(sessionId);
+      return new Response(JSON.stringify(summary), {
+        headers: { ...headers, 'Content-Type': 'application/json' }
+      });
+    }
+
+    // POST /api/metrics/tools - Record tool usage
+    if (url.pathname === '/api/metrics/tools' && req.method === 'POST') {
+      try {
+        const metric: ToolMetric = await req.json();
+
+        if (!metric.session_id || !metric.source_app || !metric.tool_name || !metric.status) {
+          return new Response(JSON.stringify({ error: 'Missing required fields' }), {
+            status: 400,
+            headers: { ...headers, 'Content-Type': 'application/json' }
+          });
+        }
+
+        const saved = insertToolMetric(metric);
+
+        // Broadcast to dashboard
+        const message = JSON.stringify({ type: 'tool_update', data: saved });
+        wsClients.forEach(client => {
+          try { client.send(message); } catch (err) { wsClients.delete(client); }
+        });
+
+        return new Response(JSON.stringify(saved), {
+          headers: { ...headers, 'Content-Type': 'application/json' }
+        });
+      } catch (error) {
+        console.error('Error recording tool metric:', error);
+        return new Response(JSON.stringify({ error: 'Invalid request' }), {
+          status: 400,
+          headers: { ...headers, 'Content-Type': 'application/json' }
+        });
+      }
+    }
+
+    // GET /api/metrics/tools - Get tool effectiveness report
+    if (url.pathname === '/api/metrics/tools' && req.method === 'GET') {
+      const sessionId = url.searchParams.get('session_id') || undefined;
+      const report = getToolEffectivenessReport(sessionId);
+      return new Response(JSON.stringify(report), {
+        headers: { ...headers, 'Content-Type': 'application/json' }
+      });
+    }
+
+    // POST /api/metrics/findings - Record a finding
+    if (url.pathname === '/api/metrics/findings' && req.method === 'POST') {
+      try {
+        const finding: Finding = await req.json();
+
+        if (!finding.session_id || !finding.source_app || !finding.finding_id || !finding.vulnerability_type) {
+          return new Response(JSON.stringify({ error: 'Missing required fields' }), {
+            status: 400,
+            headers: { ...headers, 'Content-Type': 'application/json' }
+          });
+        }
+
+        const saved = insertFinding(finding);
+
+        // Broadcast to dashboard
+        const message = JSON.stringify({ type: 'finding_update', data: saved });
+        wsClients.forEach(client => {
+          try { client.send(message); } catch (err) { wsClients.delete(client); }
+        });
+
+        return new Response(JSON.stringify(saved), {
+          headers: { ...headers, 'Content-Type': 'application/json' }
+        });
+      } catch (error) {
+        console.error('Error recording finding:', error);
+        return new Response(JSON.stringify({ error: 'Invalid request' }), {
+          status: 400,
+          headers: { ...headers, 'Content-Type': 'application/json' }
+        });
+      }
+    }
+
+    // GET /api/metrics/findings - Get findings summary or list
+    if (url.pathname === '/api/metrics/findings' && req.method === 'GET') {
+      const sessionId = url.searchParams.get('session_id') || undefined;
+      const listMode = url.searchParams.get('list') === 'true';
+
+      if (listMode) {
+        const limit = parseInt(url.searchParams.get('limit') || '100');
+        const findings = getFindings(sessionId, limit);
+        return new Response(JSON.stringify(findings), {
+          headers: { ...headers, 'Content-Type': 'application/json' }
+        });
+      }
+
+      const summary = getFindingSummary(sessionId);
+      return new Response(JSON.stringify(summary), {
+        headers: { ...headers, 'Content-Type': 'application/json' }
+      });
+    }
+
+    // POST /api/metrics/wstg - Record WSTG coverage
+    if (url.pathname === '/api/metrics/wstg' && req.method === 'POST') {
+      try {
+        const coverage: WSTGCoverage = await req.json();
+
+        if (!coverage.session_id || !coverage.source_app || !coverage.wstg_id || !coverage.status) {
+          return new Response(JSON.stringify({ error: 'Missing required fields' }), {
+            status: 400,
+            headers: { ...headers, 'Content-Type': 'application/json' }
+          });
+        }
+
+        const saved = insertWSTGCoverage(coverage);
+
+        // Broadcast to dashboard
+        const message = JSON.stringify({ type: 'wstg_update', data: saved });
+        wsClients.forEach(client => {
+          try { client.send(message); } catch (err) { wsClients.delete(client); }
+        });
+
+        return new Response(JSON.stringify(saved), {
+          headers: { ...headers, 'Content-Type': 'application/json' }
+        });
+      } catch (error) {
+        console.error('Error recording WSTG coverage:', error);
+        return new Response(JSON.stringify({ error: 'Invalid request' }), {
+          status: 400,
+          headers: { ...headers, 'Content-Type': 'application/json' }
+        });
+      }
+    }
+
+    // GET /api/metrics/wstg - Get WSTG coverage report
+    if (url.pathname === '/api/metrics/wstg' && req.method === 'GET') {
+      const sessionId = url.searchParams.get('session_id') || undefined;
+      const report = getWSTGCoverageReport(sessionId);
+      return new Response(JSON.stringify(report), {
+        headers: { ...headers, 'Content-Type': 'application/json' }
+      });
+    }
+
+    // POST /api/sessions - Create or update a session
+    if (url.pathname === '/api/sessions' && req.method === 'POST') {
+      try {
+        const session: Partial<SessionSummary> & { session_id: string } = await req.json();
+
+        if (!session.session_id) {
+          return new Response(JSON.stringify({ error: 'Missing session_id' }), {
+            status: 400,
+            headers: { ...headers, 'Content-Type': 'application/json' }
+          });
+        }
+
+        const saved = upsertSession(session);
+
+        // Broadcast to dashboard
+        const message = JSON.stringify({ type: 'session_update', data: saved });
+        wsClients.forEach(client => {
+          try { client.send(message); } catch (err) { wsClients.delete(client); }
+        });
+
+        return new Response(JSON.stringify(saved), {
+          headers: { ...headers, 'Content-Type': 'application/json' }
+        });
+      } catch (error) {
+        console.error('Error updating session:', error);
+        return new Response(JSON.stringify({ error: 'Invalid request' }), {
+          status: 400,
+          headers: { ...headers, 'Content-Type': 'application/json' }
+        });
+      }
+    }
+
+    // GET /api/sessions - Get sessions list
+    if (url.pathname === '/api/sessions' && req.method === 'GET') {
+      const status = url.searchParams.get('status') || undefined;
+      const limit = parseInt(url.searchParams.get('limit') || '50');
+      const sessions = getSessions(status, limit);
+      return new Response(JSON.stringify(sessions), {
+        headers: { ...headers, 'Content-Type': 'application/json' }
+      });
+    }
+
+    // GET /api/sessions/:id - Get a specific session
+    if (url.pathname.match(/^\/api\/sessions\/[^\/]+$/) && req.method === 'GET') {
+      const sessionId = url.pathname.split('/')[3];
+      const session = getSession(sessionId);
+
+      if (!session) {
+        return new Response(JSON.stringify({ error: 'Session not found' }), {
+          status: 404,
+          headers: { ...headers, 'Content-Type': 'application/json' }
+        });
+      }
+
+      return new Response(JSON.stringify(session), {
+        headers: { ...headers, 'Content-Type': 'application/json' }
+      });
+    }
+
+    // POST /api/sessions/:id/agents - Add agent to session
+    if (url.pathname.match(/^\/api\/sessions\/[^\/]+\/agents$/) && req.method === 'POST') {
+      try {
+        const sessionId = url.pathname.split('/')[3];
+        const { agent_name } = await req.json();
+
+        if (!agent_name) {
+          return new Response(JSON.stringify({ error: 'Missing agent_name' }), {
+            status: 400,
+            headers: { ...headers, 'Content-Type': 'application/json' }
+          });
+        }
+
+        addAgentToSession(sessionId, agent_name);
+        const session = getSession(sessionId);
+
+        return new Response(JSON.stringify(session), {
+          headers: { ...headers, 'Content-Type': 'application/json' }
+        });
+      } catch (error) {
+        return new Response(JSON.stringify({ error: 'Invalid request' }), {
+          status: 400,
+          headers: { ...headers, 'Content-Type': 'application/json' }
+        });
+      }
+    }
+
+    // GET /api/metrics/dashboard - Get full metrics dashboard
+    if (url.pathname === '/api/metrics/dashboard' && req.method === 'GET') {
+      const sessionId = url.searchParams.get('session_id') || undefined;
+      const dashboard = getMetricsDashboard(sessionId);
+      return new Response(JSON.stringify(dashboard), {
+        headers: { ...headers, 'Content-Type': 'application/json' }
+      });
+    }
+
     // WebSocket upgrade
     if (url.pathname === '/stream') {
       const success = server.upgrade(req);

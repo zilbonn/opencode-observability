@@ -51,6 +51,15 @@
             <span class="text-2xl mobile:text-base">📊</span>
           </button>
 
+          <!-- Metrics Toggle Button -->
+          <button
+            @click="showMetrics = !showMetrics"
+            class="p-3 mobile:p-1 rounded-lg bg-white/20 hover:bg-white/30 transition-all duration-200 border border-white/30 hover:border-white/50 backdrop-blur-sm shadow-lg hover:shadow-xl"
+            :title="showMetrics ? 'Hide metrics' : 'Show metrics'"
+          >
+            <span class="text-2xl mobile:text-base">📈</span>
+          </button>
+
           <!-- Theme Manager Button -->
           <button
             @click="handleThemeManagerClick"
@@ -62,7 +71,10 @@
         </div>
       </div>
     </header>
-    
+
+    <!-- Metrics Dashboard -->
+    <MetricsDashboard v-if="showMetrics" class="short:hidden" />
+
     <!-- Filters -->
     <FilterPanel
       v-if="showFilters"
@@ -148,6 +160,7 @@ import LivePulseChart from './components/LivePulseChart.vue';
 import ThemeManager from './components/ThemeManager.vue';
 import ToastNotification from './components/ToastNotification.vue';
 import AgentSwimLaneContainer from './components/AgentSwimLaneContainer.vue';
+import MetricsDashboard from './components/MetricsDashboard.vue';
 import { WS_URL } from './config';
 
 // WebSocket connection
@@ -170,6 +183,7 @@ const filters = ref({
 const stickToBottom = ref(true);
 const showThemeManager = ref(false);
 const showFilters = ref(false);
+const showMetrics = ref(false);
 const uniqueAppNames = ref<string[]>([]); // Apps active in current time window
 const allAppNames = ref<string[]>([]); // All apps ever seen in session
 const selectedAgentLanes = ref<string[]>([]);
